@@ -310,7 +310,7 @@ MACRO(kokkos_create_imported_tpl NAME)
   CMAKE_PARSE_ARGUMENTS(TPL
    "INTERFACE"
    "LIBRARY"
-   "LINK_LIBRARIES;INCLUDES;COMPILE_OPTIONS;LINK_OPTIONS"
+   "LINK_LIBRARIES;INCLUDES;COMPILE_DEFINITIONS;COMPILE_OPTIONS;LINK_OPTIONS"
    ${ARGN})
 
 
@@ -329,6 +329,9 @@ MACRO(kokkos_create_imported_tpl NAME)
     ENDIF()
     IF(TPL_INCLUDES)
       TARGET_INCLUDE_DIRECTORIES(${NAME} INTERFACE ${TPL_INCLUDES})
+    ENDIF()
+    IF(TPL_COMPILE_DEFINITIONS)
+      TARGET_COMPILE_DEFINITIONS(${NAME} INTERFACE ${TPL_COMPILE_DEFINITIONS})
     ENDIF()
     IF(TPL_COMPILE_OPTIONS)
       TARGET_COMPILE_OPTIONS(${NAME} INTERFACE ${TPL_COMPILE_OPTIONS})
@@ -350,6 +353,10 @@ MACRO(kokkos_create_imported_tpl NAME)
     IF(TPL_INCLUDES)
       SET_TARGET_PROPERTIES(${NAME} PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES "${TPL_INCLUDES}")
+    ENDIF()
+    IF(TPL_COMPILE_DEFINITIONS)
+      SET_TARGET_PROPERTIES(${NAME} PROPERTIES
+        INTERFACE_COMPILE_DEFINITIONS "${TPL_COMPILE_DEFINITIONS}")
     ENDIF()
     IF(TPL_COMPILE_OPTIONS)
       SET_TARGET_PROPERTIES(${NAME} PROPERTIES
@@ -766,7 +773,7 @@ FUNCTION(kokkos_link_tpl TARGET)
 ENDFUNCTION()
 
 FUNCTION(COMPILER_SPECIFIC_OPTIONS_HELPER)
-  SET(COMPILERS NVIDIA PGI XL DEFAULT Cray Intel Clang AppleClang IntelClang GNU HIP Fujitsu)
+  SET(COMPILERS NVIDIA PGI XL DEFAULT Cray Intel Clang AppleClang IntelLLVM GNU HIPCC Fujitsu)
   CMAKE_PARSE_ARGUMENTS(
     PARSE
     "LINK_OPTIONS;COMPILE_OPTIONS;COMPILE_DEFINITIONS;LINK_LIBRARIES"
@@ -922,6 +929,9 @@ ENDFUNCTION()
 #       DIRECTORY   --> all files in directory
 #       PROJECT     --> all files/targets in a project/subproject
 #
+# NOTE: this is VERY DIFFERENT than the version in KokkosConfigCommon.cmake.in.
+# This version explicitly uses nvcc_wrapper.
+#
 FUNCTION(kokkos_compilation)
     # check whether the compiler already supports building CUDA
     KOKKOS_CXX_COMPILER_CUDA_TEST(Kokkos_CXX_COMPILER_COMPILES_CUDA)
@@ -943,10 +953,21 @@ FUNCTION(kokkos_compilation)
         MESSAGE(FATAL_ERROR "Kokkos could not find 'kokkos_launch_compiler'. Please set '-DKokkos_COMPILE_LAUNCHER=/path/to/launcher'")
     ENDIF()
 
+    # find nvcc_wrapper
+    FIND_PROGRAM(Kokkos_NVCC_WRAPPER
+        NAMES           nvcc_wrapper
+        HINTS           ${PROJECT_SOURCE_DIR}
+        PATHS           ${PROJECT_SOURCE_DIR}
+        PATH_SUFFIXES   bin)
+
+    IF(NOT Kokkos_COMPILE_LAUNCHER)
+        MESSAGE(FATAL_ERROR "Kokkos could not find 'nvcc_wrapper'. Please set '-DKokkos_COMPILE_LAUNCHER=/path/to/nvcc_wrapper'")
+    ENDIF()
+
     IF(COMP_GLOBAL)
         # if global, don't bother setting others
-        SET_PROPERTY(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${Kokkos_COMPILE_LAUNCHER} ${CMAKE_CXX_COMPILER}")
-        SET_PROPERTY(GLOBAL PROPERTY RULE_LAUNCH_LINK "${Kokkos_COMPILE_LAUNCHER} ${CMAKE_CXX_COMPILER}")
+        SET_PROPERTY(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${Kokkos_COMPILE_LAUNCHER} ${Kokkos_NVCC_WRAPPER} ${CMAKE_CXX_COMPILER}")
+        SET_PROPERTY(GLOBAL PROPERTY RULE_LAUNCH_LINK "${Kokkos_COMPILE_LAUNCHER} ${Kokkos_NVCC_WRAPPER} ${CMAKE_CXX_COMPILER}")
     ELSE()
         FOREACH(_TYPE PROJECT DIRECTORY TARGET SOURCE)
             # make project/subproject scoping easy, e.g. KokkosCompilation(PROJECT) after project(...)
@@ -957,8 +978,8 @@ FUNCTION(kokkos_compilation)
             # set the properties if defined
             IF(COMP_${_TYPE})
                 # MESSAGE(STATUS "Using nvcc_wrapper :: ${_TYPE} :: ${COMP_${_TYPE}}")
-                SET_PROPERTY(${_TYPE} ${COMP_${_TYPE}} PROPERTY RULE_LAUNCH_COMPILE "${Kokkos_COMPILE_LAUNCHER} ${CMAKE_CXX_COMPILER}")
-                SET_PROPERTY(${_TYPE} ${COMP_${_TYPE}} PROPERTY RULE_LAUNCH_LINK "${Kokkos_COMPILE_LAUNCHER} ${CMAKE_CXX_COMPILER}")
+                SET_PROPERTY(${_TYPE} ${COMP_${_TYPE}} PROPERTY RULE_LAUNCH_COMPILE "${Kokkos_COMPILE_LAUNCHER} ${Kokkos_NVCC_WRAPPER} ${CMAKE_CXX_COMPILER}")
+                SET_PROPERTY(${_TYPE} ${COMP_${_TYPE}} PROPERTY RULE_LAUNCH_LINK "${Kokkos_COMPILE_LAUNCHER} ${Kokkos_NVCC_WRAPPER} ${CMAKE_CXX_COMPILER}")
             ENDIF()
         ENDFOREACH()
     ENDIF()

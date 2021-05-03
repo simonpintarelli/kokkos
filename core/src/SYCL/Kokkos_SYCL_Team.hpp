@@ -68,7 +68,7 @@ class SYCLTeamMember {
   mutable void* m_team_reduce;
   scratch_memory_space m_team_shared;
   int m_team_reduce_size;
-  sycl::nd_item<1> m_item;
+  sycl::nd_item<2> m_item;
 
  public:
   KOKKOS_INLINE_FUNCTION
@@ -78,40 +78,53 @@ class SYCLTeamMember {
 
   KOKKOS_INLINE_FUNCTION
   const execution_space::scratch_memory_space& team_scratch(
-      const int& level) const {
+      const int level) const {
     return m_team_shared.set_team_thread_mode(level, 1, 0);
   }
 
   KOKKOS_INLINE_FUNCTION
   const execution_space::scratch_memory_space& thread_scratch(
-      const int& level) const {
+      const int level) const {
     return m_team_shared.set_team_thread_mode(level, team_size(), team_rank());
   }
 
-  KOKKOS_INLINE_FUNCTION int league_rank() const { return m_item.get_group(0); }
+  KOKKOS_INLINE_FUNCTION int league_rank() const {
+    return m_item.get_group_linear_id();
+  }
   KOKKOS_INLINE_FUNCTION int league_size() const {
+    // FIXME_SYCL needs to be revised for vector_length>1.
     return m_item.get_group_range(0);
   }
   KOKKOS_INLINE_FUNCTION int team_rank() const {
-    return m_item.get_local_id(0);
+    return m_item.get_local_linear_id();
   }
   KOKKOS_INLINE_FUNCTION int team_size() const {
+    // FIXME_SYCL needs to be revised for vector_length>1.
     return m_item.get_local_range(0);
   }
   KOKKOS_INLINE_FUNCTION void team_barrier() const { m_item.barrier(); }
 
+  KOKKOS_INLINE_FUNCTION const sycl::nd_item<2>& item() const { return m_item; }
+
   //--------------------------------------------------------------------------
 
   template <class ValueType>
-  KOKKOS_INLINE_FUNCTION void team_broadcast(ValueType& /*val*/,
-                                             const int& /*thread_id*/) const {
-    // FIXME_SYCL
-    Kokkos::abort("Not implemented!");
+  KOKKOS_INLINE_FUNCTION void team_broadcast(ValueType& val,
+                                             const int thread_id) const {
+    // Wait for shared data write until all threads arrive here
+    m_item.barrier(sycl::access::fence_space::local_space);
+    if (m_item.get_local_id(1) == 0 &&
+        static_cast<int>(m_item.get_local_id(0)) == thread_id) {
+      *static_cast<ValueType*>(m_team_reduce) = val;
+    }
+    // Wait for shared data read until root thread writes
+    m_item.barrier(sycl::access::fence_space::local_space);
+    val = *static_cast<ValueType*>(m_team_reduce);
   }
 
   template <class Closure, class ValueType>
   KOKKOS_INLINE_FUNCTION void team_broadcast(Closure const& f, ValueType& val,
-                                             const int& thread_id) const {
+                                             const int thread_id) const {
     f(val);
     team_broadcast(val, thread_id);
   }
@@ -129,10 +142,82 @@ class SYCLTeamMember {
   template <typename ReducerType>
   KOKKOS_INLINE_FUNCTION
       typename std::enable_if<is_reducer<ReducerType>::value>::type
-      team_reduce(ReducerType const& /*reducer*/,
-                  typename ReducerType::value_type& /*value*/) const noexcept {
-    // FIXME_SYCL
-    Kokkos::abort("Not implemented!");
+      team_reduce(ReducerType const& reducer,
+                  typename ReducerType::value_type& value) const noexcept {
+    using value_type = typename ReducerType::value_type;
+
+    // We need to chunk up the whole reduction because we might not have
+    // allocated enough memory.
+    const int maximum_work_range =
+        std::min<int>(m_team_reduce_size / sizeof(value_type), team_size());
+
+    int smaller_power_of_two = 1;
+    while ((smaller_power_of_two << 1) < maximum_work_range)
+      smaller_power_of_two <<= 1;
+
+    const int idx        = team_rank();
+    auto reduction_array = static_cast<value_type*>(m_team_reduce);
+
+    // Load values into the first maximum_work_range values of the reduction
+    // array in chunks. This means that only threads with an id in the
+    // corresponding chunk load values and the reduction is always done by the
+    // first smaller_power_of_two threads.
+    if (idx < maximum_work_range) reduction_array[idx] = value;
+    m_item.barrier(sycl::access::fence_space::local_space);
+
+    for (int start = maximum_work_range; start < team_size();
+         start += maximum_work_range) {
+      if (idx >= start &&
+          idx < std::min(start + maximum_work_range, team_size()))
+        reducer.join(reduction_array[idx - start], value);
+      m_item.barrier(sycl::access::fence_space::local_space);
+    }
+
+    for (int stride = smaller_power_of_two; stride > 0; stride >>= 1) {
+      if (idx < stride && idx + stride < maximum_work_range)
+        reducer.join(reduction_array[idx], reduction_array[idx + stride]);
+      m_item.barrier(sycl::access::fence_space::local_space);
+    }
+    reducer.reference() = reduction_array[0];
+    m_item.barrier(sycl::access::fence_space::local_space);
+  }
+
+  // FIXME_SYCL move somewhere else and combine with other places that do
+  // parallel_scan
+  // Exclusive scan returning the total sum.
+  // n is required to be a power of two and
+  // temp must point to an array containing the data to be processed
+  // The accumulated value is returned.
+  template <typename Type>
+  static Type prescan(sycl::nd_item<2> m_item, Type* temp, int n) {
+    int thid = m_item.get_local_id(0);
+
+    // First do a reduction saving intermediate results
+    for (int stride = 1; stride < n; stride <<= 1) {
+      auto idx = 2 * stride * (thid + 1) - 1;
+      if (idx < n) temp[idx] += temp[idx - stride];
+      m_item.barrier(sycl::access::fence_space::local_space);
+    }
+
+    Type total_sum = temp[n - 1];
+    m_item.barrier(sycl::access::fence_space::local_space);
+
+    // clear the last element so we get an exclusive scan
+    if (thid == 0) temp[n - 1] = Type{};
+    m_item.barrier(sycl::access::fence_space::local_space);
+
+    // Now add the intermediate results to the remaining items again
+    for (int stride = n / 2; stride > 0; stride >>= 1) {
+      auto idx = 2 * stride * (thid + 1) - 1;
+      if (idx < n) {
+        Type dummy         = temp[idx - stride];
+        temp[idx - stride] = temp[idx];
+        temp[idx] += dummy;
+      }
+      m_item.barrier(sycl::access::fence_space::local_space);
+    }
+
+    return total_sum;
   }
 
   //--------------------------------------------------------------------------
@@ -147,10 +232,53 @@ class SYCLTeamMember {
    */
   template <typename Type>
   KOKKOS_INLINE_FUNCTION Type team_scan(const Type& value,
-                                        Type* const /*global_accum*/) const {
-    // FIXME_SYCL
-    Kokkos::abort("Not implemented!");
-    return value;
+                                        Type* const global_accum) const {
+    // We need to chunk up the whole reduction because we might not have
+    // allocated enough memory.
+    const int maximum_work_range =
+        std::min<int>(m_team_reduce_size / sizeof(Type), team_size());
+
+    int not_greater_power_of_two = 1;
+    while ((not_greater_power_of_two << 1) < maximum_work_range + 1)
+      not_greater_power_of_two <<= 1;
+
+    Type intermediate;
+    Type total{};
+
+    const int idx        = team_rank();
+    const auto base_data = static_cast<Type*>(m_team_reduce);
+
+    // Load values into the first not_greater_power_of_two values of the
+    // reduction array in chunks. This means that only threads with an id in the
+    // corresponding chunk load values and the reduction is always done by the
+    // first not_greater_power_of_two threads.
+    for (int start = 0; start < team_size();
+         start += not_greater_power_of_two) {
+      m_item.barrier(sycl::access::fence_space::local_space);
+      if (idx >= start && idx < start + not_greater_power_of_two) {
+        base_data[idx - start] = value;
+      }
+      m_item.barrier(sycl::access::fence_space::local_space);
+
+      const Type partial_total =
+          prescan(m_item, base_data, not_greater_power_of_two);
+      if (idx >= start && idx < start + not_greater_power_of_two)
+        intermediate = base_data[idx - start] + total;
+      if (start == 0)
+        total = partial_total;
+      else
+        total += partial_total;
+    }
+
+    if (global_accum) {
+      if (team_size() == idx + 1) {
+        base_data[team_size()] = atomic_fetch_add(global_accum, total);
+      }
+      m_item.barrier();  // Wait for atomic
+      intermediate += base_data[team_size()];
+    }
+
+    return intermediate;
   }
 
   /** \brief  Intra-team exclusive prefix sum with team_rank() ordering.
@@ -203,7 +331,7 @@ class SYCLTeamMember {
   KOKKOS_INLINE_FUNCTION
   SYCLTeamMember(void* shared, const int shared_begin, const int shared_size,
                  void* scratch_level_1_ptr, const int scratch_level_1_size,
-                 const sycl::nd_item<1> item)
+                 const sycl::nd_item<2> item)
       : m_team_reduce(shared),
         m_team_shared(static_cast<char*>(shared) + shared_begin, shared_size,
                       scratch_level_1_ptr, scratch_level_1_size),
@@ -326,13 +454,14 @@ KOKKOS_INLINE_FUNCTION
       thread, count);
 }
 
-template <typename iType>
-KOKKOS_INLINE_FUNCTION
-    Impl::ThreadVectorRangeBoundariesStruct<iType, Impl::SYCLTeamMember>
-    ThreadVectorRange(const Impl::SYCLTeamMember& thread, iType arg_begin,
-                      iType arg_end) {
+template <typename iType1, typename iType2>
+KOKKOS_INLINE_FUNCTION Impl::ThreadVectorRangeBoundariesStruct<
+    typename std::common_type<iType1, iType2>::type, Impl::SYCLTeamMember>
+ThreadVectorRange(const Impl::SYCLTeamMember& thread, iType1 arg_begin,
+                  iType2 arg_end) {
+  using iType = typename std::common_type<iType1, iType2>::type;
   return Impl::ThreadVectorRangeBoundariesStruct<iType, Impl::SYCLTeamMember>(
-      thread, arg_begin, arg_end);
+      thread, iType(arg_begin), iType(arg_end));
 }
 
 KOKKOS_INLINE_FUNCTION
@@ -360,8 +489,11 @@ KOKKOS_INLINE_FUNCTION void parallel_for(
     const Impl::TeamThreadRangeBoundariesStruct<iType, Impl::SYCLTeamMember>&
         loop_boundaries,
     const Closure& closure) {
-  for (iType i = loop_boundaries.start + loop_boundaries.member.team_rank();
-       i < loop_boundaries.end; i += loop_boundaries.member.team_size())
+  // FIXME_SYCL Fix for vector_length>1.
+  for (iType i = loop_boundaries.start +
+                 loop_boundaries.member.item().get_local_id(0);
+       i < loop_boundaries.end;
+       i += loop_boundaries.member.item().get_local_range(0))
     closure(i);
 }
 
@@ -379,11 +511,20 @@ template <typename iType, class Closure, class ReducerType>
 KOKKOS_INLINE_FUNCTION
     typename std::enable_if<Kokkos::is_reducer<ReducerType>::value>::type
     parallel_reduce(const Impl::TeamThreadRangeBoundariesStruct<
-                        iType, Impl::SYCLTeamMember>& /*loop_boundaries*/,
-                    const Closure& /*closure*/,
-                    const ReducerType& /*reducer*/) {
-  // FIXME_SYCL
-  Kokkos::abort("Not implemented!");
+                        iType, Impl::SYCLTeamMember>& loop_boundaries,
+                    const Closure& closure, const ReducerType& reducer) {
+  typename ReducerType::value_type value;
+  reducer.init(value);
+
+  // FIXME_SYCL Fix for vector_length>1.
+  for (iType i = loop_boundaries.start +
+                 loop_boundaries.member.item().get_local_id(0);
+       i < loop_boundaries.end;
+       i += loop_boundaries.member.item().get_local_range(0)) {
+    closure(i, value);
+  }
+
+  loop_boundaries.member.team_reduce(reducer, value);
 }
 
 /** \brief  Inter-thread parallel_reduce assuming summation.
@@ -398,10 +539,23 @@ template <typename iType, class Closure, typename ValueType>
 KOKKOS_INLINE_FUNCTION
     typename std::enable_if<!Kokkos::is_reducer<ValueType>::value>::type
     parallel_reduce(const Impl::TeamThreadRangeBoundariesStruct<
-                        iType, Impl::SYCLTeamMember>& /*loop_boundaries*/,
-                    const Closure& /*closure*/, ValueType& /*result*/) {
-  // FIXME_SYCL
-  Kokkos::abort("Not implemented!");
+                        iType, Impl::SYCLTeamMember>& loop_boundaries,
+                    const Closure& closure, ValueType& result) {
+  ValueType val;
+  Kokkos::Sum<ValueType> reducer(val);
+
+  reducer.init(reducer.reference());
+
+  // FIXME_SYCL Fix for vector_length>1.
+  for (iType i = loop_boundaries.start +
+                 loop_boundaries.member.item().get_local_id(0);
+       i < loop_boundaries.end;
+       i += loop_boundaries.member.item().get_local_range(0)) {
+    closure(i, val);
+  }
+
+  loop_boundaries.member.team_reduce(reducer, val);
+  result = reducer.reference();
 }
 
 /** \brief  Inter-thread parallel exclusive prefix sum.
@@ -455,7 +609,11 @@ KOKKOS_INLINE_FUNCTION void parallel_for(
     const Impl::TeamVectorRangeBoundariesStruct<iType, Impl::SYCLTeamMember>&
         loop_boundaries,
     const Closure& closure) {
-  for (auto i = loop_boundaries.start; i != loop_boundaries.end; ++i)
+  // FIXME_SYCL adapt for vector_length != 1
+  for (iType i = loop_boundaries.start +
+                 loop_boundaries.member.item().get_local_id(0);
+       i < loop_boundaries.end;
+       i += loop_boundaries.member.item().get_local_range(0))
     closure(i);
 }
 
@@ -463,21 +621,43 @@ template <typename iType, class Closure, class ReducerType>
 KOKKOS_INLINE_FUNCTION
     typename std::enable_if<Kokkos::is_reducer<ReducerType>::value>::type
     parallel_reduce(const Impl::TeamVectorRangeBoundariesStruct<
-                        iType, Impl::SYCLTeamMember>& /*loop_boundaries*/,
-                    const Closure& /*closure*/,
-                    const ReducerType& /*reducer*/) {
-  // FIXME_SYCL
-  Kokkos::abort("Not implemented!");
+                        iType, Impl::SYCLTeamMember>& loop_boundaries,
+                    const Closure& closure, const ReducerType& reducer) {
+  // FIXME_SYCL adapt for vector_length != 1
+  typename ReducerType::value_type value;
+  reducer.init(value);
+
+  for (iType i = loop_boundaries.start +
+                 loop_boundaries.member.item().get_local_id(0);
+       i < loop_boundaries.end;
+       i += loop_boundaries.member.item().get_local_range(0)) {
+    closure(i, value);
+  }
+
+  loop_boundaries.member.team_reduce(reducer, value);
 }
 
 template <typename iType, class Closure, typename ValueType>
 KOKKOS_INLINE_FUNCTION
     typename std::enable_if<!Kokkos::is_reducer<ValueType>::value>::type
     parallel_reduce(const Impl::TeamVectorRangeBoundariesStruct<
-                        iType, Impl::SYCLTeamMember>& /*loop_boundaries*/,
-                    const Closure& /*closure*/, ValueType& /*result*/) {
-  // FIXME_SYCL
-  Kokkos::abort("Not implemented!");
+                        iType, Impl::SYCLTeamMember>& loop_boundaries,
+                    const Closure& closure, ValueType& result) {
+  // FIXME_SYCL adapt for vector_length != 1
+  ValueType val;
+  Kokkos::Sum<ValueType> reducer(val);
+
+  reducer.init(reducer.reference());
+
+  for (iType i = loop_boundaries.start +
+                 loop_boundaries.member.item().get_local_id(0);
+       i < loop_boundaries.end;
+       i += loop_boundaries.member.item().get_local_range(0)) {
+    closure(i, val);
+  }
+
+  loop_boundaries.member.team_reduce(reducer, val);
+  result = reducer.reference();
 }
 
 //----------------------------------------------------------------------------
@@ -493,6 +673,7 @@ KOKKOS_INLINE_FUNCTION void parallel_for(
     const Impl::ThreadVectorRangeBoundariesStruct<iType, Impl::SYCLTeamMember>&
         loop_boundaries,
     const Closure& closure) {
+  // FIXME_SYC: adapt for vector_length!=1
   for (auto i = loop_boundaries.start; i != loop_boundaries.end; ++i)
     closure(i);
 }
@@ -514,11 +695,14 @@ template <typename iType, class Closure, class ReducerType>
 KOKKOS_INLINE_FUNCTION
     typename std::enable_if<is_reducer<ReducerType>::value>::type
     parallel_reduce(Impl::ThreadVectorRangeBoundariesStruct<
-                        iType, Impl::SYCLTeamMember> const& /*loop_boundaries*/,
-                    Closure const& /*closure*/,
-                    ReducerType const& /*reducer*/) {
-  // FIXME_SYCL
-  Kokkos::abort("Not implemented!");
+                        iType, Impl::SYCLTeamMember> const& loop_boundaries,
+                    Closure const& closure, ReducerType const& reducer) {
+  // FIXME_SYCL adapt for vector_length != 1
+  reducer.init(reducer.reference());
+
+  for (iType i = loop_boundaries.start; i < loop_boundaries.end; ++i) {
+    closure(i, reducer.reference());
+  }
 }
 
 /** \brief  Intra-thread vector parallel_reduce.
@@ -536,13 +720,43 @@ template <typename iType, class Closure, typename ValueType>
 KOKKOS_INLINE_FUNCTION
     typename std::enable_if<!is_reducer<ValueType>::value>::type
     parallel_reduce(Impl::ThreadVectorRangeBoundariesStruct<
-                        iType, Impl::SYCLTeamMember> const& /*loop_boundaries*/,
-                    Closure const& /*closure*/, ValueType& /*result*/) {
-  // FIXME_SYCL
-  Kokkos::abort("Not implemented!");
+                        iType, Impl::SYCLTeamMember> const& loop_boundaries,
+                    Closure const& closure, ValueType& result) {
+  // FIXME_SYCL adapt for vector_length != 1
+  result = ValueType();
+
+  for (iType i = loop_boundaries.start; i < loop_boundaries.end; ++i) {
+    closure(i, result);
+  }
 }
 
 //----------------------------------------------------------------------------
+
+/** \brief  Intra-thread vector parallel exclusive prefix sum with reducer.
+ *
+ *  Executes closure(iType i, ValueType & val, bool final) for each i=[0..N)
+ *
+ *  The range [0..N) is mapped to all vector lanes in the
+ *  thread and a scan operation is performed.
+ *  The last call to closure has final == true.
+ */
+template <typename iType, class Closure, typename ReducerType>
+KOKKOS_INLINE_FUNCTION
+    typename std::enable_if<Kokkos::is_reducer<ReducerType>::value>::type
+    parallel_scan(const Impl::ThreadVectorRangeBoundariesStruct<
+                      iType, Impl::SYCLTeamMember>& loop_boundaries,
+                  const Closure& closure, const ReducerType& reducer) {
+  // FIXME_SYCL modify for vector_length!=1
+  using value_type = typename Kokkos::Impl::FunctorAnalysis<
+      Kokkos::Impl::FunctorPatternInterface::SCAN, void, Closure>::value_type;
+
+  value_type accum;
+  reducer.init(accum);
+
+  for (iType i = loop_boundaries.start; i < loop_boundaries.end; ++i) {
+    closure(i, accum, true);
+  }
+}
 
 /** \brief  Intra-thread vector parallel exclusive prefix sum.
  *
@@ -555,10 +769,12 @@ KOKKOS_INLINE_FUNCTION
 template <typename iType, class Closure>
 KOKKOS_INLINE_FUNCTION void parallel_scan(
     const Impl::ThreadVectorRangeBoundariesStruct<iType, Impl::SYCLTeamMember>&
-    /*loop_boundaries*/,
-    const Closure& /*closure*/) {
-  // FIXME_SYCL
-  Kokkos::abort("Not implemented!");
+        loop_boundaries,
+    const Closure& closure) {
+  using value_type = typename Kokkos::Impl::FunctorAnalysis<
+      Kokkos::Impl::FunctorPatternInterface::SCAN, void, Closure>::value_type;
+  value_type dummy;
+  parallel_scan(loop_boundaries, closure, Kokkos::Sum<value_type>{dummy});
 }
 
 }  // namespace Kokkos
@@ -567,34 +783,30 @@ namespace Kokkos {
 
 template <class FunctorType>
 KOKKOS_INLINE_FUNCTION void single(
-    const Impl::VectorSingleStruct<Impl::SYCLTeamMember>&,
-    const FunctorType& /*lambda*/) {
-  // FIXME_SYCL
-  Kokkos::abort("Not implemented!");
+    const Impl::VectorSingleStruct<Impl::SYCLTeamMember>& single_struct,
+    const FunctorType& lambda) {
+  if (single_struct.team_member.item().get_local_id(1) == 0) lambda();
 }
 
 template <class FunctorType>
 KOKKOS_INLINE_FUNCTION void single(
-    const Impl::ThreadSingleStruct<Impl::SYCLTeamMember>&,
-    const FunctorType& /*lambda*/) {
-  // FIXME_SYCL
-  Kokkos::abort("Not implemented!");
+    const Impl::ThreadSingleStruct<Impl::SYCLTeamMember>& single_struct,
+    const FunctorType& lambda) {
+  if (single_struct.team_member.team_rank() == 0) lambda();
 }
 
 template <class FunctorType, class ValueType>
 KOKKOS_INLINE_FUNCTION void single(
-    const Impl::VectorSingleStruct<Impl::SYCLTeamMember>&,
-    const FunctorType& /*lambda*/, ValueType& /*val*/) {
-  // FIXME_SYCL
-  Kokkos::abort("Not implemented!");
+    const Impl::VectorSingleStruct<Impl::SYCLTeamMember>& single_struct,
+    const FunctorType& lambda, ValueType& val) {
+  if (single_struct.team_member.item().get_local_id(1) == 0) lambda(val);
 }
 
 template <class FunctorType, class ValueType>
 KOKKOS_INLINE_FUNCTION void single(
-    const Impl::ThreadSingleStruct<Impl::SYCLTeamMember>& /*single_struct*/,
-    const FunctorType& /*lambda*/, ValueType& /*val*/) {
-  // FIXME_SYCL
-  Kokkos::abort("Not implemented!");
+    const Impl::ThreadSingleStruct<Impl::SYCLTeamMember>& single_struct,
+    const FunctorType& lambda, ValueType& val) {
+  if (single_struct.team_member.team_rank() == 0) lambda(val);
 }
 
 }  // namespace Kokkos

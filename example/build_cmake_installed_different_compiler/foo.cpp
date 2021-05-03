@@ -42,42 +42,52 @@
 //@HEADER
 */
 
-#include <Kokkos_Macros.hpp>
-#ifdef KOKKOS_ENABLE_HIP
-
-#include <cstdint>
-#include <iostream>
-#include <iomanip>
-
-#include <gtest/gtest.h>
-
 #include <Kokkos_Core.hpp>
+#include <cstdio>
 
-#include <TestRandom.hpp>
-#include <TestSort.hpp>
+struct CountFunctor {
+  KOKKOS_FUNCTION void operator()(const long i, long& lcount) const {
+    lcount += (i % 2) == 0;
+  }
+};
 
-namespace Test {
+int main(int argc, char* argv[]) {
+  Kokkos::initialize(argc, argv);
+  Kokkos::DefaultExecutionSpace::print_configuration(std::cout);
 
-void hip_test_random_xorshift64(size_t num_draws) {
-  Impl::test_random<Kokkos::Random_XorShift64_Pool<Kokkos::Experimental::HIP>>(
-      num_draws);
-  Impl::test_random<Kokkos::Random_XorShift64_Pool<Kokkos::Device<
-      Kokkos::Experimental::HIP, Kokkos::Experimental::HIPSpace>>>(num_draws);
+  if (argc < 2) {
+    fprintf(stderr, "Usage: %s [<kokkos_options>] <size>\n", argv[0]);
+    Kokkos::finalize();
+    exit(1);
+  }
+
+  const long n = strtol(argv[1], nullptr, 10);
+
+  printf("Number of even integers from 0 to %ld\n", n - 1);
+
+  Kokkos::Timer timer;
+  timer.reset();
+
+  // Compute the number of even integers from 0 to n-1, in parallel.
+  long count = 0;
+  CountFunctor functor;
+  Kokkos::parallel_reduce(n, functor, count);
+
+  double count_time = timer.seconds();
+  printf("  Parallel: %ld    %10.6f\n", count, count_time);
+
+  timer.reset();
+
+  // Compare to a sequential loop.
+  long seq_count = 0;
+  for (long i = 0; i < n; ++i) {
+    seq_count += (i % 2) == 0;
+  }
+
+  count_time = timer.seconds();
+  printf("Sequential: %ld    %10.6f\n", seq_count, count_time);
+
+  Kokkos::finalize();
+
+  return (count == seq_count) ? 0 : -1;
 }
-
-void hip_test_random_xorshift1024(size_t num_draws) {
-  Impl::test_random<
-      Kokkos::Random_XorShift1024_Pool<Kokkos::Experimental::HIP>>(num_draws);
-  Impl::test_random<Kokkos::Random_XorShift1024_Pool<Kokkos::Device<
-      Kokkos::Experimental::HIP, Kokkos::Experimental::HIPSpace>>>(num_draws);
-}
-
-TEST(hip, Random_XorShift64) { hip_test_random_xorshift64(132141141); }
-TEST(hip, Random_XorShift1024_0) { hip_test_random_xorshift1024(52428813); }
-TEST(hip, SortUnsigned) {
-  Impl::test_sort<Kokkos::Experimental::HIP, unsigned>(171);
-}
-}  // namespace Test
-#else
-void KOKKOS_ALGORITHMS_UNITTESTS_TESTHIP_PREVENT_LINK_ERROR() {}
-#endif /* #ifdef KOKKOS_ENABLE_HIP */

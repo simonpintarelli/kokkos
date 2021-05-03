@@ -77,74 +77,24 @@ int get_gpu(const InitArguments& args);
 
 namespace Experimental {
 SYCL::SYCL()
-    : m_space_instance(&Impl::SYCLInternal::singleton()), m_counter(nullptr) {
+    : m_space_instance(&Impl::SYCLInternal::singleton(),
+                       [](Impl::SYCLInternal*) {}) {
   Impl::SYCLInternal::singleton().verify_is_initialized(
       "SYCL instance constructor");
 }
 
 SYCL::SYCL(const sycl::queue& stream)
-    : m_space_instance(new Impl::SYCLInternal), m_counter(new int(1)) {
+    : m_space_instance(new Impl::SYCLInternal, [](Impl::SYCLInternal* ptr) {
+        ptr->finalize();
+        delete ptr;
+      }) {
   Impl::SYCLInternal::singleton().verify_is_initialized(
       "SYCL instance constructor");
   m_space_instance->initialize(stream);
 }
 
-KOKKOS_FUNCTION SYCL::SYCL(SYCL&& other) noexcept
-    : m_space_instance(other.m_space_instance), m_counter(other.m_counter) {
-  other.m_space_instance = nullptr;
-  other.m_counter        = nullptr;
-}
-
-KOKKOS_FUNCTION SYCL::SYCL(const SYCL& other)
-    : m_space_instance(other.m_space_instance), m_counter(other.m_counter) {
-#ifndef KOKKOS_ACTIVE_EXECUTION_MEMORY_SPACE_SYCL
-  if (m_counter) Kokkos::atomic_add(m_counter, 1);
-#endif
-}
-
-KOKKOS_FUNCTION SYCL& SYCL::operator=(SYCL&& other) noexcept {
-  if (&other != this) {
-    cleanup();
-    m_space_instance       = other.m_space_instance;
-    other.m_space_instance = nullptr;
-    m_counter              = other.m_counter;
-    other.m_counter        = nullptr;
-  }
-  return *this;
-}
-
-KOKKOS_FUNCTION SYCL& SYCL::operator=(const SYCL& other) {
-  if (&other != this) {
-    cleanup();
-    m_space_instance = other.m_space_instance;
-    m_counter        = other.m_counter;
-#ifndef KOKKOS_ACTIVE_EXECUTION_MEMORY_SPACE_SYCL
-    if (m_counter) Kokkos::atomic_add(m_counter, 1);
-#endif
-  }
-  return *this;
-}
-
-KOKKOS_FUNCTION SYCL::~SYCL() { cleanup(); }
-
-KOKKOS_FUNCTION void SYCL::cleanup() noexcept {
-#ifndef KOKKOS_ACTIVE_EXECUTION_MEMORY_SPACE_SYCL
-  // If m_counter is set, then this instance is responsible for managing the
-  // objects pointed to by m_counter and m_space_instance.
-  if (m_counter == nullptr) return;
-  int const count = Kokkos::atomic_fetch_sub(m_counter, 1);
-  if (count == 1) {
-    delete m_counter;
-    m_space_instance->finalize();
-    delete m_space_instance;
-  }
-#endif
-}
-
 int SYCL::concurrency() {
-  // FIXME_SYCL We need a value larger than 1 here for some tests to pass,
-  // clearly this is true but not the roght value
-  return 2;
+  return Impl::SYCLInternal::singleton().m_maxConcurrency;
 }
 
 const char* SYCL::name() { return "SYCL"; }
@@ -174,6 +124,18 @@ SYCL::SYCLDevice::SYCLDevice(sycl::device d) : m_device(std::move(d)) {}
 
 SYCL::SYCLDevice::SYCLDevice(const sycl::device_selector& selector)
     : m_device(selector.select_device()) {}
+
+SYCL::SYCLDevice::SYCLDevice(size_t id) {
+  std::vector<sycl::device> gpu_devices =
+      sycl::device::get_devices(sycl::info::device_type::gpu);
+  if (id >= gpu_devices.size()) {
+    std::stringstream error_message;
+    error_message << "Requested GPU with id " << id << " but only "
+                  << gpu_devices.size() << " GPU(s) available!\n";
+    Kokkos::Impl::throw_runtime_exception(error_message.str());
+  }
+  m_device = gpu_devices[id];
+}
 
 sycl::device SYCL::SYCLDevice::get_device() const { return m_device; }
 
@@ -307,9 +269,13 @@ void SYCLSpaceInitializer::initialize(const InitArguments& args) {
   if (std::is_same<Kokkos::Experimental::SYCL,
                    Kokkos::DefaultExecutionSpace>::value ||
       0 < use_gpu) {
-    // FIXME_SYCL choose a specific device
-    Kokkos::Experimental::SYCL::impl_initialize(
-        Kokkos::Experimental::SYCL::SYCLDevice(sycl::default_selector()));
+    if (use_gpu > -1) {
+      Kokkos::Experimental::SYCL::impl_initialize(
+          Kokkos::Experimental::SYCL::SYCLDevice(use_gpu));
+    } else {
+      Kokkos::Experimental::SYCL::impl_initialize(
+          Kokkos::Experimental::SYCL::SYCLDevice(sycl::default_selector()));
+    }
   }
 }
 
