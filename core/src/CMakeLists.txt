@@ -78,6 +78,12 @@ KOKKOS_LIB_INCLUDE_DIRECTORIES(kokkoscore
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+if(${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang")
+  target_compile_options(kokkoscore PUBLIC -stdlib=libc++)
+endif()
+
+
+
 KOKKOS_LINK_TPL(kokkoscore PUBLIC HWLOC)
 KOKKOS_LINK_TPL(kokkoscore PUBLIC MEMKIND)
 KOKKOS_LINK_TPL(kokkoscore PUBLIC CUDA)
